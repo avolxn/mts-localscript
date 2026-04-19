@@ -1,0 +1,34 @@
+{
+  "example-1": {
+    "required_substrings": ["wf.vars.emails", "#wf.vars.emails", "return"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-2": {
+    "required_substrings": ["wf.vars.try_count_n", "+ 1"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-3": {
+    "required_substrings": ["ID", "ENTITY_ID", "CALL", "nil", "return"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-4": {
+    "required_substrings": ["string.format", "T", "Z", "DATUM", "TIME"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-5": {
+    "required_substrings": ["ensureArray", "items", "return"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-6": {
+    "required_substrings": ["Discount", "Markdown", "return"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-7": {
+    "required_substrings": ["n * n", "tonumber"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  },
+  "example-8": {
+    "required_substrings": ["recallTime", "return", "86400"],
+    "forbidden_substrings": ["```", "jsonpath"]
+  }
+}

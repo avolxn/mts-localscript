@@ -1,0 +1,38 @@
+from .client import MCPClientError, MCPServerConfig, call_mcp_tool, list_mcp_tools
+from .config import (
+    add_server,
+    clear_tool_custom_description,
+    config_path_for_workspace,
+    disable_server,
+    disable_tool,
+    enable_server,
+    enable_tool,
+    ensure_config_dir,
+    list_servers,
+    load_config,
+    refresh_server_tools,
+    remove_server,
+    save_config,
+    set_tool_custom_description,
+)
+
+__all__ = [
+    "MCPClientError",
+    "MCPServerConfig",
+    "add_server",
+    "call_mcp_tool",
+    "clear_tool_custom_description",
+    "config_path_for_workspace",
+    "disable_server",
+    "disable_tool",
+    "enable_server",
+    "enable_tool",
+    "ensure_config_dir",
+    "list_mcp_tools",
+    "list_servers",
+    "load_config",
+    "refresh_server_tools",
+    "remove_server",
+    "save_config",
+    "set_tool_custom_description",
+]

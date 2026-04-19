@@ -1,0 +1,2025 @@
+from __future__ import annotations
+
+import asyncio
+import shlex
+from asyncio import Future
+from collections.abc import Callable
+from contextlib import suppress
+from functools import partial
+from itertools import filterfalse
+from operator import attrgetter
+from pathlib import Path
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Literal
+
+from rich.segment import Segment
+from textual import containers, events, getters, log, on, work
+from textual.actions import SkipAction
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.content import Content
+from textual.css.query import NoMatches
+from textual.geometry import Offset, Region, Spacing, clamp
+from textual.layout import WidgetPlacement
+from textual.layouts.grid import GridLayout
+from textual.reactive import var
+from textual.strip import Strip
+from textual.widget import Widget
+from textual.widgets import Static
+from textual.widgets.markdown import MarkdownBlock, MarkdownFence
+
+from localscript.mcp.config import (
+    add_server,
+    clear_tool_custom_description,
+    config_path_for_workspace,
+    disable_server,
+    disable_tool,
+    enable_server,
+    enable_tool,
+    list_servers,
+    refresh_server_tools,
+    remove_server,
+    set_tool_custom_description,
+)
+from localscript_ui import jsonrpc, messages, paths
+from localscript_ui.acp import messages as acp_messages
+from localscript_ui.acp import protocol as acp_protocol
+from localscript_ui.acp.agent import Mode
+from localscript_ui.agent import AgentBase, AgentFail, AgentReady
+from localscript_ui.agent_schema import Agent as AgentData
+from localscript_ui.answer import Answer
+from localscript_ui.app import ToadApp
+from localscript_ui.directory_watcher import DirectoryChanged, DirectoryWatcher
+from localscript_ui.format_path import format_path
+from localscript_ui.history import History
+from localscript_ui.menus import MenuItem
+from localscript_ui.protocol import BlockProtocol, ExpandProtocol, MenuProtocol
+from localscript_ui.shell import CurrentWorkingDirectoryChanged, Shell
+from localscript_ui.slash_command import SlashCommand
+from localscript_ui.widgets.flash import Flash
+from localscript_ui.widgets.menu import Menu
+from localscript_ui.widgets.note import Note
+from localscript_ui.widgets.prompt import Prompt
+from localscript_ui.widgets.session_tabs import SessionsTabs
+from localscript_ui.widgets.shell_terminal import ShellTerminal
+from localscript_ui.widgets.terminal import Terminal
+from localscript_ui.widgets.throbber import Throbber
+from localscript_ui.widgets.user_input import UserInput
+
+if TYPE_CHECKING:
+    from localscript_ui.widgets.agent_response import AgentResponse
+    from localscript_ui.widgets.agent_thought import AgentThought
+    from localscript_ui.widgets.terminal import Terminal
+    from localscript_ui.widgets.terminal_tool import TerminalTool
+
+
+AGENT_FAIL_HELP = {
+    "fail": """\
+## Agent failed to run
+
+**The agent failed to start.**
+
+Check that the agent is installed and up-to-date.
+
+Note that some agents require an ACP adapter to be installed to work with LocalScript UI.
+
+- Exit the app, and run `localscript-ui` again
+- Select the agent and hit ENTER
+- Click the dropdown, select "Install"
+- Click the GO button
+- Repeat the process to install an ACP adapter (if required)
+
+Some agents may require you to restart your shell (open a new terminal) after installing.
+
+If that fails, check the LocalScript repository for support information.
+""",
+    "no_resume": """\
+## Agent does not support resume
+
+The agent or ACP adapter does not support resuming sessions.
+
+Try updating to see if support has been added.
+
+- Exit the app, and run `localscript-ui` again
+- Select the agent and hit ENTER
+- Click the dropdown, select "Update" or "Install" again
+- Repeat the process to update the ACP adapter (if required)
+
+If that fails, check the LocalScript repository for support information.
+""",
+}
+
+HELP_URL = "the LocalScript project"
+
+INTERNAL_EROR = f"""\
+## Internal error
+
+The agent reported an internal error:
+
+```
+$ERROR
+```
+
+This is likely an issue with the agent, and not LocalScript UI.
+
+- Try the prompt again
+- Report the issue to the Agent developer
+
+Ask on {HELP_URL} if you need assistance.
+
+"""
+
+STOP_REASON_MAX_TOKENS = f"""\
+## Maximum tokens reached
+
+$AGENT reported that your account is out of tokens.
+
+- You may need to purchase additional tokens, or fund your account.
+- If your account has tokens, try running any login or auth process again.
+
+If that fails, ask on {HELP_URL}
+"""
+
+STOP_REASON_MAX_TURN_REQUESTS = f"""\
+## Maximum model requests reached
+
+$AGENT has exceeded the maximum number of model requests in a single turn.
+
+Need help? Ask on {HELP_URL}
+"""
+
+STOP_REASON_REFUSAL = f"""\
+## Agent refusal
+
+$AGENT has refused to continue.
+
+Need help? Ask on {HELP_URL}
+"""
+
+
+class Loading(Static):
+    """Tiny widget to show loading indicator."""
+
+    DEFAULT_CLASSES = "block"
+    DEFAULT_CSS = """
+    Loading {
+        height: auto;
+    }
+    """
+
+
+class Cursor(Static):
+    """The block 'cursor' -- A vertical line to the left of a block in the conversation that
+    is used to navigate the discussion history.
+    """
+
+    follow_widget: var[Widget | None] = var(None)
+    blink = var(True, toggle_class="-blink")
+
+    def on_mount(self) -> None:
+        self.visible = False
+        self.blink_timer = self.set_interval(0.5, self._update_blink, pause=True)
+
+    def _update_blink(self) -> None:
+        if self.query_ancestor(Window).has_focus and self.screen.is_active:
+            self.blink = not self.blink
+        else:
+            self.blink = False
+
+    def watch_follow_widget(self, widget: Widget | None) -> None:
+        self.visible = widget is not None
+
+    def update_follow(self) -> None:
+        if self.follow_widget and self.follow_widget.is_attached:
+            self.styles.height = max(1, self.follow_widget.outer_size.height)
+            follow_y = self.follow_widget.virtual_region.y + self.follow_widget.parent.virtual_region.y
+            self.offset = Offset(0, follow_y)
+        else:
+            self.styles.height = None
+
+    def follow(self, widget: Widget | None) -> None:
+        self.follow_widget = widget
+        self.blink = False
+        if widget is None:
+            self.visible = False
+            self.blink_timer.reset()
+            self.blink_timer.pause()
+            self.styles.height = None
+        else:
+            self.visible = True
+            self.blink_timer.reset()
+            self.blink_timer.resume()
+            self.update_follow()
+
+
+class Contents(containers.VerticalGroup, can_focus=False):
+    BLANK = True
+
+    def process_layout(self, placements: list[WidgetPlacement]) -> list[WidgetPlacement]:
+        if placements:
+            last_placement = placements[-1]
+            top, right, _bottom, left = last_placement.margin
+            placements[-1] = last_placement._replace(margin=Spacing(top, right, 0, left))
+        return placements
+
+
+class ContentsGrid(containers.Grid):
+    BLANK = True
+
+    def pre_layout(self, layout) -> None:
+        assert isinstance(layout, GridLayout)
+        layout.stretch_height = True
+
+
+class CursorContainer(containers.Vertical):
+    def render_lines(self, crop: Region) -> list[Strip]:
+        rich_style = self.visual_style.rich_style
+        strips = [Strip([Segment("▌", rich_style)], cell_length=1)] * crop.height
+        if crop.y == 0 and strips:
+            strips[0] = Strip([Segment(" ", rich_style)], cell_length=1)
+
+        return strips
+
+
+class Window(containers.VerticalScroll):
+    HELP = """\
+## Conversation
+
+This is a view of your conversation with the agent.
+
+- **cursor keys** Scroll
+- **alt+up / alt+down** Navigate content
+- **start typing** Focus the prompt
+"""
+    BINDING_GROUP_TITLE = "View"
+    BINDINGS = [Binding("end", "screen.focus_prompt", "Prompt")]
+
+    def update_node_styles(self, animate: bool = True) -> None:
+        pass
+
+
+class Conversation(containers.Vertical):
+    """Holds the agent conversation (input, output, and various controls / information)."""
+
+    BLANK = True
+    BINDING_GROUP_TITLE = "Conversation"
+    CURSOR_BINDING_GROUP = Binding.Group(description="Cursor")
+    BINDINGS = [
+        Binding(
+            "alt+up",
+            "cursor_up",
+            "Block cursor up",
+            priority=True,
+            group=CURSOR_BINDING_GROUP,
+        ),
+        Binding(
+            "alt+down",
+            "cursor_down",
+            "Block cursor down",
+            group=CURSOR_BINDING_GROUP,
+        ),
+        Binding(
+            "enter",
+            "select_block",
+            "Select",
+            tooltip="Select this block",
+        ),
+        Binding(
+            "space",
+            "expand_block",
+            "Expand",
+            key_display="␣",
+            tooltip="Expand cursor block",
+        ),
+        Binding(
+            "space",
+            "collapse_block",
+            "Collapse",
+            key_display="␣",
+            tooltip="Collapse cursor block",
+        ),
+        Binding(
+            "escape",
+            "cancel",
+            "Cancel",
+            tooltip="Cancel agent's turn",
+        ),
+        Binding(
+            "ctrl+f",
+            "focus_terminal",
+            "Focus",
+            tooltip="Focus the active terminal",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+o",
+            "mode_switcher",
+            "Modes",
+            tooltip="Open the mode switcher",
+        ),
+        Binding(
+            "ctrl+c",
+            "interrupt",
+            "Interrupt",
+            tooltip="Interrupt running command",
+        ),
+    ]
+
+    busy_count = var(0)
+    cursor_offset = var(-1, init=False)
+    project_path = var("")
+    working_directory: var[str] = var("")
+    _blocks: var[list[MarkdownBlock] | None] = var(None)
+
+    throbber: getters.query_one[Throbber] = getters.query_one("#throbber")
+    contents = getters.query_one(Contents)
+    window = getters.query_one(Window)
+    cursor = getters.query_one(Cursor)
+    prompt = getters.query_one(Prompt)
+    app = getters.app(ToadApp)
+
+    _shell: var[Shell | None] = var(None)
+    shell_history_index: var[int] = var(0, init=False)
+    prompt_history_index: var[int] = var(0, init=False)
+
+    agent: var[AgentBase | None] = var(None, bindings=True)
+    agent_info: var[Content] = var(Content())
+    agent_ready: var[bool] = var(False)
+    modes: var[dict[str, Mode]] = var({}, bindings=True)
+    current_mode: var[Mode | None] = var(None)
+    turn: var[Literal["agent", "client"] | None] = var(None, bindings=True)
+    status: var[str] = var("")
+    column: var[bool] = var(False, toggle_class="-column")
+
+    title = var("")
+
+    def __init__(
+        self,
+        project_path: Path,
+        agent: AgentData | None = None,
+        agent_session_id: str | None = None,
+        session_pk: int | None = None,
+        initial_prompt: str | None = None,
+    ) -> None:
+        super().__init__()
+
+        project_path = project_path.resolve().absolute()
+
+        self.set_reactive(Conversation.project_path, project_path)
+        self.set_reactive(Conversation.working_directory, str(project_path))
+        self.agent_slash_commands: list[SlashCommand] = []
+        self.terminals: dict[str, TerminalTool] = {}
+        self._loading: Loading | None = None
+        self._agent_response: AgentResponse | None = None
+        self._agent_thought: AgentThought | None = None
+        self._last_escape_time: float = monotonic()
+        self._agent_data = agent
+        self._agent_session_id = agent_session_id
+        self._session_pk = session_pk
+        self._agent_fail = False
+        self._mouse_down_offset: Offset | None = None
+
+        self._focusable_terminals: list[Terminal] = []
+
+        self.project_data_path = paths.get_project_data(project_path)
+        self.shell_history = History(self.project_data_path / "shell_history.jsonl")
+        self.prompt_history = History(self.project_data_path / "prompt_history.jsonl")
+
+        self.session_start_time: float | None = None
+        self._terminal_count = 0
+        self._require_check_prune = False
+
+        self._turn_count = 0
+        self._shell_count = 0
+
+        self._directory_changed = False
+        self._directory_watcher: DirectoryWatcher | None = None
+
+        self._initial_prompt = initial_prompt
+
+        self._post_lock = asyncio.Lock()
+
+    def update_title(self) -> None:
+        """Update the screen title."""
+
+        if agent_title := self.agent_title:
+            project_path = format_path(self.project_path)
+            self.screen.title = f"{agent_title} {project_path}"
+        else:
+            self.screen.title = ""
+
+    @property
+    def agent_title(self) -> str | None:
+        if self._agent_data is not None:
+            return self._agent_data["name"]
+        return None
+
+    @property
+    def is_watching_directory(self) -> bool:
+        """Is the directory watcher enabled and watching?"""
+        if self._directory_watcher is None:
+            return False
+        return self._directory_watcher.enabled
+
+    def validate_shell_history_index(self, index: int) -> int:
+        return clamp(index, -self.shell_history.size, 0)
+
+    def validate_prompt_history_index(self, index: int) -> int:
+        return clamp(index, -self.prompt_history.size, 0)
+
+    def shell_complete(self, prefix: str) -> list[str]:
+        completes = self.shell_history.complete(prefix)
+        return completes
+
+    def insert_path_into_prompt(self, path: Path) -> None:
+        try:
+            insert_path_text = str(path.relative_to(self.project_path))
+        except Exception:
+            self.app.bell()
+            return
+
+        insert_text = f'@"{insert_path_text}"' if " " in insert_path_text else f"@{insert_path_text}"
+        self.prompt.prompt_text_area.insert(insert_text)
+        self.prompt.prompt_text_area.insert(" ")
+
+    def watch_project_path(self, path: Path) -> None:
+        self.post_message(messages.SessionUpdate(path=str(path)))
+
+    async def watch_shell_history_index(self, previous_index: int, index: int) -> None:
+        if previous_index == 0:
+            self.shell_history.current = self.prompt.text
+        try:
+            history_entry = await self.shell_history.get_entry(index)
+        except IndexError:
+            pass
+        else:
+            self.prompt.text = history_entry["input"]
+            self.prompt.shell_mode = True
+
+    async def watch_prompt_history_index(self, previous_index: int, index: int) -> None:
+        if previous_index == 0:
+            self.prompt_history.current = self.prompt.text
+        try:
+            history_entry = await self.prompt_history.get_entry(index)
+        except IndexError:
+            pass
+        else:
+            self.prompt.text = history_entry["input"]
+
+    def watch_turn(self, turn: str) -> None:
+        if turn == "client":
+            self.post_message(messages.SessionUpdate(state="idle"))
+        elif turn == "agent":
+            self.post_message(messages.SessionUpdate(state="busy"))
+
+    @on(events.Key)
+    async def on_key(self, event: events.Key):
+        if (
+            event.character is not None
+            and event.is_printable
+            and (event.character.isalnum() or event.character in "$/!")
+            and self.window.has_focus
+        ):
+            self.prompt.focus()
+            self.prompt.prompt_text_area.post_message(event)
+
+    def compose(self) -> ComposeResult:
+        yield Throbber(id="throbber")
+        yield SessionsTabs()
+        with Window():
+            with ContentsGrid():
+                with CursorContainer(id="cursor-container"):
+                    yield Cursor()
+                yield Contents(id="contents")
+        yield Flash()
+        yield Prompt(complete_callback=self.shell_complete).data_bind(
+            project_path=Conversation.project_path,
+            working_directory=Conversation.working_directory,
+            agent_info=Conversation.agent_info,
+            agent_ready=Conversation.agent_ready,
+            current_mode=Conversation.current_mode,
+            modes=Conversation.modes,
+            status=Conversation.status,
+        )
+
+    @property
+    def _terminal(self) -> Terminal | None:
+        """Return the last focusable terminal, if there is one.
+
+        Returns:
+            A focusable (non finalized) terminal.
+        """
+        # Terminals should be removed in response to the Terminal.FInalized message
+        # This is a bit of a sanity check
+        self._focusable_terminals[:] = list(filterfalse(attrgetter("is_finalized"), self._focusable_terminals))
+
+        for terminal in reversed(self._focusable_terminals):
+            if terminal.display:
+                return terminal
+        return None
+
+    def add_focusable_terminal(self, terminal: Terminal) -> None:
+        """Add a focusable terminal.
+
+        Args:
+            terminal: Terminal instance.
+        """
+        if not terminal.is_finalized:
+            self._focusable_terminals.append(terminal)
+
+    @on(ShellTerminal.Interrupt)
+    async def on_shell_terminal_terminate(self, event: ShellTerminal.Terminate) -> None:
+        if not event.teminal.is_finalized:
+            await self.shell.interrupt()
+            self.cursor_offset = -1
+            self.flash("Command interrupted", style="success")
+
+    @on(DirectoryChanged)
+    def on_directory_changed(self, event: DirectoryChanged) -> None:
+        event.stop()
+        if self.turn is None or self.turn == "client":
+            self.post_message(messages.ProjectDirectoryUpdated())
+        else:
+            self._directory_changed = True
+
+    @on(Terminal.Finalized)
+    def on_terminal_finalized(self, event: Terminal.Finalized) -> None:
+        """Terminal was finalized, so we can remove it from the list."""
+        try:
+            self._focusable_terminals.remove(event.terminal)
+        except ValueError:
+            pass
+
+        if self._directory_changed or not self.is_watching_directory:
+            self.prompt.project_directory_updated()
+            self._directory_changed = False
+            self.post_message(messages.ProjectDirectoryUpdated())
+
+    @on(Terminal.LongRunning)
+    def on_terminal_long_running(self, event: Terminal.LongRunning) -> None:
+        if (
+            not event.terminal.is_finalized
+            and not event.terminal.has_focus
+            and not event.terminal.state.buffer.is_blank
+        ):
+            self.flash("Press [b]ctrl+f[/b] to focus command", style="default")
+
+    @on(Terminal.AlternateScreenChanged)
+    def on_terminal_alternate_screen_(self, event: Terminal.AlternateScreenChanged) -> None:
+        """A terminal enabled or disabled alternate screen."""
+        if event.enabled:
+            event.terminal.focus()
+        else:
+            self.focus_prompt()
+
+    @on(events.DescendantFocus, "Terminal")
+    def on_terminal_focus(self, event: events.DescendantFocus) -> None:
+        self.flash("Press [b]escape[/b] [i]twice[/] to exit terminal", style="success")
+
+    @on(events.DescendantBlur, "Terminal")
+    def on_terminal_blur(self, event: events.DescendantFocus) -> None:
+        self.focus_prompt()
+
+    @on(messages.Flash)
+    def on_flash(self, event: messages.Flash) -> None:
+        event.stop()
+        self.flash(event.content, duration=event.duration, style=event.style)
+
+    def flash(
+        self,
+        content: str | Content,
+        *,
+        duration: float | None = None,
+        style: Literal["default", "warning", "error", "success"] = "default",
+    ) -> None:
+        """Flash a single-line message to the user.
+
+        Args:
+            content: Content to flash.
+            style: A semantic style.
+            duration: Duration in seconds of the flash, or `None` to use default in settings.
+        """
+        self.query_one(Flash).flash(content, duration=duration, style=style)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "focus_terminal":
+            return None if self._terminal is None else True
+        if action == "mode_switcher":
+            return bool(self.modes)
+        if action == "cancel":
+            return True if (self.agent and self.turn == "agent") else None
+        if action in {"expand_block", "collapse_block"}:
+            if (cursor_block := self.cursor_block) is None:
+                return False
+            elif isinstance(cursor_block, ExpandProtocol):
+                if action == "expand_block":
+                    return False if cursor_block.is_block_expanded() else True
+                else:
+                    return True if cursor_block.is_block_expanded() else False
+            return None if action == "expand_block" else False
+
+        return True
+
+    async def action_focus_terminal(self) -> None:
+        if self._terminal is not None:
+            self._terminal.focus()
+        else:
+            self.flash("Nothing to focus...", style="error")
+
+    async def action_expand_block(self) -> None:
+        if (cursor_block := self.cursor_block) is not None:
+            if isinstance(cursor_block, ExpandProtocol):
+                cursor_block.expand_block()
+                self.refresh_bindings()
+                self.call_after_refresh(self.cursor.follow, cursor_block)
+
+    async def action_collapse_block(self) -> None:
+        if (cursor_block := self.cursor_block) is not None:
+            if isinstance(cursor_block, ExpandProtocol):
+                cursor_block.collapse_block()
+                self.refresh_bindings()
+                self.call_after_refresh(self.cursor.follow, cursor_block)
+
+    async def post_agent_response(self, fragment: str = "") -> AgentResponse | None:
+        """Get or create an agent response widget."""
+        from localscript_ui.widgets.agent_response import AgentResponse
+
+        async with self._post_lock:
+            if self._agent_response is None:
+                self._agent_response = agent_response = AgentResponse(fragment)
+                await self.post(agent_response, new_block=False)
+            else:
+                await self._agent_response.append_fragment(fragment)
+            return self._agent_response
+
+    async def post_agent_thought(self, thought_fragment: str) -> AgentThought | None:
+        """Get or create an agent thought widget."""
+        from localscript_ui.widgets.agent_thought import AgentThought
+
+        async with self._post_lock:
+            if self._agent_thought is None:
+                if thought_fragment.strip():
+                    self._agent_thought = AgentThought(thought_fragment)
+                    await self.post(self._agent_thought, new_block=False)
+            else:
+                await self._agent_thought.append_fragment(thought_fragment)
+            return self._agent_thought
+
+    @property
+    def cursor_block(self) -> Widget | None:
+        """The block next to the cursor, or `None` if no block cursor."""
+        if self.cursor_offset == -1 or not self.contents.displayed_children:
+            return None
+        try:
+            block_widget = self.contents.displayed_children[self.cursor_offset]
+        except IndexError:
+            return None
+        return block_widget
+
+    @property
+    def cursor_block_child(self) -> Widget | None:
+        if (cursor_block := self.cursor_block) is not None:
+            if isinstance(cursor_block, BlockProtocol):
+                return cursor_block.get_cursor_block()
+        return cursor_block
+
+    def get_cursor_block[BlockType](self, block_type: type[BlockType] = Widget) -> BlockType | None:
+        """Get the cursor block if it matches a type.
+
+        Args:
+            block_type: The expected type.
+
+        Returns:
+            The widget next to the cursor, or `None` if the types don't match.
+        """
+        cursor_block = self.cursor_block_child
+        if isinstance(cursor_block, block_type):
+            return cursor_block
+        return None
+
+    @on(AgentReady)
+    async def on_agent_ready(self) -> None:
+        self.session_start_time = monotonic()
+        if self.agent is not None:
+            content = Content.assemble(self.agent.get_info(), " connected")
+            self.flash(content, style="success")
+            if self._agent_data is not None:
+                self.app.capture_event(
+                    "agent-session-begin",
+                    agent=self._agent_data["identity"],
+                )
+
+        self.agent_ready = True
+
+    async def on_unmount(self) -> None:
+        if self._directory_watcher is not None:
+            self._directory_watcher.stop()
+        if self.agent is not None:
+            await self.agent.stop()
+
+        if self._agent_data is not None and self.session_start_time is not None:
+            session_time = monotonic() - self.session_start_time
+            await self.app.capture_event(
+                "agent-session-end",
+                agent=self._agent_data["identity"],
+                duration=session_time,
+                agent_session_fail=self._agent_fail,
+                shell_count=self._shell_count,
+                turn_count=self._turn_count,
+            ).wait()
+
+    @on(AgentFail)
+    async def on_agent_fail(self, message: AgentFail) -> None:
+        self.agent_ready = True
+        self._agent_fail = True
+        self.notify(message.message, title="Agent failure", severity="error", timeout=5)
+
+        if self._agent_data is not None:
+            self.app.capture_event(
+                "agent-session-error",
+                agent=self._agent_data["identity"],
+                message=message.message,
+                details=message.details,
+            )
+
+        if message.message:
+            error = Content.assemble(
+                Content.from_markup(message.message).stylize("$text-error"),
+                " — ",
+                Content.from_markup(message.details.strip()).stylize("dim"),
+            )
+        else:
+            error = Content.from_markup(message.details.strip()).stylize("$text-error")
+        await self.post(Note(error, classes="-error"))
+
+        from localscript_ui.widgets.markdown_note import MarkdownNote
+
+        if message.help in AGENT_FAIL_HELP:
+            help = AGENT_FAIL_HELP[message.help]
+        else:
+            help = AGENT_FAIL_HELP["fail"]
+
+        await self.post(MarkdownNote(help))
+
+    @on(messages.WorkStarted)
+    def on_work_started(self) -> None:
+        self.busy_count += 1
+
+    @on(messages.WorkFinished)
+    def on_work_finished(self) -> None:
+        self.busy_count -= 1
+
+    @work
+    @on(messages.ChangeMode)
+    async def on_change_mode(self, event: messages.ChangeMode) -> None:
+        await self.set_mode(event.mode_id)
+
+    @on(acp_messages.ModeUpdate)
+    def on_mode_update(self, event: acp_messages.ModeUpdate) -> None:
+        if (modes := self.modes) is not None:
+            if (mode := modes.get(event.current_mode)) is not None:
+                self.current_mode = mode
+
+    @on(messages.UserInputSubmitted)
+    async def on_user_input_submitted(self, event: messages.UserInputSubmitted) -> None:
+        if not event.body.strip():
+            return
+        if event.shell:
+            if await self.shell.is_busy():
+                if self.shell.terminal is not None:
+                    self.shell.terminal.focus(scroll_visible=False)
+                await self.shell.send_input(event.body, paste=True)
+            else:
+                await self.shell_history.append(event.body)
+                self.shell_history_index = 0
+                await self.post_shell(event.body)
+            self.window.scroll_end(animate=False)
+        elif text := event.body.strip():
+            await self.prompt_history.append(event.body)
+            self.prompt_history_index = 0
+            if text.startswith("/") and await self.slash_command(text):
+                # LocalScript UI has processed the slash command.
+                return
+            await self.post(UserInput(text))
+            self.window.scroll_end(animate=False)
+            self._loading = await self.post(Loading("Please wait..."), loading=True)
+            await asyncio.sleep(0)
+            self.send_prompt_to_agent(text)
+
+    @work
+    async def send_prompt_to_agent(self, prompt: str) -> None:
+        if self.agent is not None:
+            stop_reason: str | None = None
+            self.busy_count += 1
+            try:
+                self.turn = "agent"
+                stop_reason = await self.agent.send_prompt(prompt)
+            except jsonrpc.APIError as error:
+                from localscript_ui.widgets.markdown_note import MarkdownNote
+
+                self.turn = "client"
+
+                message = error.message or "no details were provided"
+
+                await self.post(
+                    MarkdownNote(
+                        INTERNAL_EROR.replace("$ERROR", message),
+                        classes="-stop-reason",
+                    )
+                )
+            finally:
+                self.busy_count -= 1
+            self.call_later(self.agent_turn_over, stop_reason)
+
+    async def agent_turn_over(self, stop_reason: str | None) -> None:
+        """Called when the agent's turn is over.
+
+        Args:
+            stop_reason: The stop reason returned from the Agent, or `None`.
+        """
+        self.turn = "client"
+        if self._agent_thought is not None and self._agent_thought.loading:
+            await self._agent_thought.remove()
+        if self._loading is not None:
+            await self._loading.remove()
+        self._agent_response = None
+        self._agent_thought = None
+
+        if self._directory_changed or not self.is_watching_directory:
+            self._directory_changed = False
+            self.post_message(messages.ProjectDirectoryUpdated())
+            self.prompt.project_directory_updated()
+
+        self._turn_count += 1
+
+        self.post_message(messages.SessionUpdate(state="idle"))
+
+        if stop_reason != "end_turn":
+            from localscript_ui.widgets.markdown_note import MarkdownNote
+
+            agent = (self.agent_title or "agent").title()
+
+            if stop_reason == "max_tokens":
+                await self.post(
+                    MarkdownNote(
+                        STOP_REASON_MAX_TOKENS.replace("$AGENT", agent),
+                        classes="-stop-reason",
+                    )
+                )
+            elif stop_reason == "max_turn_requests":
+                await self.post(
+                    MarkdownNote(
+                        STOP_REASON_MAX_TURN_REQUESTS.replace("$AGENT", agent),
+                        classes="-stop-reason",
+                    )
+                )
+            elif stop_reason == "refusal":
+                await self.post(
+                    MarkdownNote(
+                        STOP_REASON_REFUSAL.replace("$AGENT", agent),
+                        classes="-stop-reason",
+                    )
+                )
+
+        if self.app.settings.get("notifications.turn_over", bool):
+            self.app.system_notify(
+                f"{self.agent_title} has finished working",
+                title="Waiting for input",
+                sound="turn-over",
+            )
+
+    @on(Menu.OptionSelected)
+    async def on_menu_option_selected(self, event: Menu.OptionSelected) -> None:
+        event.stop()
+        event.menu.display = False
+        if event.action is not None:
+            await self.run_action(event.action, {"block": event.owner})
+        if (cursor_block := self.get_cursor_block()) is not None:
+            self.call_after_refresh(self.cursor.follow, cursor_block)
+        self.call_after_refresh(event.menu.remove)
+
+    @on(Menu.Dismissed)
+    async def on_menu_dismissed(self, event: Menu.Dismissed) -> None:
+        event.stop()
+        if event.menu.has_focus:
+            self.window.focus(scroll_visible=False)
+        await event.menu.remove()
+
+    @on(CurrentWorkingDirectoryChanged)
+    def on_current_working_directory_changed(self, event: CurrentWorkingDirectoryChanged) -> None:
+        self.working_directory = str(Path(event.path).resolve().absolute())
+
+    async def watch_busy_count(self, busy: int) -> None:
+        if (throbber := self.query_one_optional("#throbber")) is not None:
+            throbber.set_class(busy > 0, "-busy")
+
+    @on(acp_messages.UpdateStatusLine)
+    async def on_update_status_line(self, message: acp_messages.UpdateStatusLine):
+        self.status = message.status_line
+
+    @on(acp_messages.Update)
+    async def on_acp_agent_message(self, message: acp_messages.Update):
+        message.stop()
+        self._agent_thought = None
+        await self.post_agent_response(message.text)
+
+    @on(acp_messages.UserMessage)
+    async def on_acp_user_message(self, message: acp_messages.UserMessage):
+        self._agent_thought = None
+        self._agent_response = None
+        message.stop()
+        await self.post(UserInput(message.text))
+
+    @on(acp_messages.Thinking)
+    async def on_acp_agent_thinking(self, message: acp_messages.Thinking):
+        message.stop()
+        await self.post_agent_thought(message.text)
+
+    @on(acp_messages.RequestPermission)
+    async def on_acp_request_permission(self, message: acp_messages.RequestPermission):
+        message.stop()
+        options = [Answer(option["name"], option["optionId"], option["kind"]) for option in message.options]
+        self.request_permissions(
+            message.result_future,
+            options,
+            message.tool_call,
+        )
+        self._agent_response = None
+        self._agent_thought = None
+
+    @on(acp_messages.Plan)
+    async def on_acp_plan(self, message: acp_messages.Plan):
+        from localscript_ui.widgets.plan import Plan
+
+        entries = [
+            Plan.Entry(
+                Content(entry["content"]),
+                entry.get("priority", "medium"),
+                entry.get("status", "pending"),
+            )
+            for entry in message.entries
+        ]
+
+        if self.contents.children and isinstance((current_plan := self.contents.children[-1]), Plan):
+            current_plan.entries = entries
+        else:
+            await self.post(Plan(entries))
+
+    @on(acp_messages.ToolCallUpdate)
+    @on(acp_messages.ToolCall)
+    async def on_acp_tool_call_update(self, message: acp_messages.ToolCall | acp_messages.ToolCallUpdate):
+        from localscript_ui.widgets.tool_call import ToolCall
+
+        tool_call = message.tool_call
+
+        if tool_call.get("status", None) in (None, "completed"):
+            self._agent_thought = None
+            self._agent_response = None
+
+        tool_id = message.tool_id
+        try:
+            existing_tool_call: ToolCall | None = self.contents.get_child_by_id(tool_id, ToolCall)
+        except NoMatches:
+            await self.post(ToolCall(tool_call, id=message.tool_id), new_block=True)
+        else:
+            if existing_tool_call is not None:
+                await existing_tool_call.update_tool_call(tool_call)
+
+    @on(acp_messages.AvailableCommandsUpdate)
+    async def on_acp_available_commands_update(self, message: acp_messages.AvailableCommandsUpdate):
+        slash_commands: list[SlashCommand] = []
+        for available_command in message.commands:
+            input = available_command.get("input", {}) or {}
+            slash_command = SlashCommand(
+                f"/{available_command['name']}",
+                available_command["description"],
+                hint=input.get("hint"),
+            )
+            slash_commands.append(slash_command)
+        self.agent_slash_commands = slash_commands
+        self.update_slash_commands()
+
+    def get_terminal(self, terminal_id: str) -> TerminalTool | None:
+        """Get a terminal from its id.
+
+        Args:
+            terminal_id: ID of the terminal.
+
+        Returns:
+            Terminal instance, or `None` if no terminal was found.
+        """
+        from localscript_ui.widgets.terminal_tool import TerminalTool
+
+        try:
+            terminal = self.contents.query_one(f"#{terminal_id}", TerminalTool)
+        except NoMatches:
+            return None
+        if terminal.released:
+            return None
+        return terminal
+
+    async def action_interrupt(self) -> None:
+        terminal = self._terminal
+        if terminal is not None and not terminal.is_finalized:
+            await self.shell.interrupt()
+            # self._shell = None
+            self.flash("Command interrupted", style="success")
+        else:
+            raise SkipAction()
+
+    def action_focus_block(self, block_id: str) -> None:
+        with suppress(NoMatches):
+            self.query_one(f"#{block_id}").focus()
+
+    @work
+    @on(acp_messages.CreateTerminal)
+    async def on_acp_create_terminal(self, message: acp_messages.CreateTerminal):
+        from localscript_ui.widgets.terminal_tool import Command, TerminalTool
+
+        command = Command(
+            message.command,
+            message.args or [],
+            message.env or {},
+            message.cwd or str(self.project_path),
+        )
+        width = self.window.size.width - 5 - self.window.styles.scrollbar_size_vertical
+        height = self.window.scrollable_content_region.height - 2
+
+        terminal = TerminalTool(
+            command,
+            output_byte_limit=message.output_byte_limit,
+            id=message.terminal_id,
+            minimum_terminal_width=width,
+        )
+        self.terminals[message.terminal_id] = terminal
+        terminal.display = False
+
+        try:
+            await terminal.start(width, height)
+        except Exception as error:
+            log(str(error))
+            message.result_future.set_result(False)
+            return
+
+        try:
+            await self.post(terminal)
+        except Exception:
+            message.result_future.set_result(False)
+        else:
+            message.result_future.set_result(True)
+
+    @on(acp_messages.KillTerminal)
+    async def on_acp_kill_terminal(self, message: acp_messages.KillTerminal):
+        if (terminal := self.get_terminal(message.terminal_id)) is not None:
+            terminal.kill()
+
+    @on(acp_messages.GetTerminalState)
+    def on_acp_get_terminal_state(self, message: acp_messages.GetTerminalState):
+        if (terminal := self.get_terminal(message.terminal_id)) is None:
+            message.result_future.set_exception(KeyError(f"No terminal with id {message.terminal_id!r}"))
+        else:
+            message.result_future.set_result(terminal.tool_state)
+
+    @on(acp_messages.ReleaseTerminal)
+    def on_acp_terminal_release(self, message: acp_messages.ReleaseTerminal):
+        if (terminal := self.get_terminal(message.terminal_id)) is not None:
+            terminal.kill()
+            terminal.release()
+
+    @work
+    @on(acp_messages.WaitForTerminalExit)
+    async def on_acp_wait_for_terminal_exit(self, message: acp_messages.WaitForTerminalExit):
+        if (terminal := self.get_terminal(message.terminal_id)) is None:
+            message.result_future.set_exception(KeyError(f"No terminal with id {message.terminal_id!r}"))
+        else:
+            return_code, signal = await terminal.wait_for_exit()
+            message.result_future.set_result((return_code or 0, signal))
+
+    async def set_mode(self, mode_id: str | None) -> None:
+        """Set the mode give its id (if it exists).
+
+        Args:
+            mode_id: Id of mode.
+
+        Returns:
+            `True` if the mode was changed, `False` if it didn't exist.
+        """
+        if (agent := self.agent) is None:
+            return
+        if mode_id is None:
+            self.current_mode = None
+        else:
+            if (error := await agent.set_mode(mode_id)) is not None:
+                self.notify(error, title="Set Mode", severity="error")
+            elif (new_mode := self.modes.get(mode_id)) is not None:
+                self.current_mode = new_mode
+                self.flash(
+                    Content.from_markup("Mode changed to [b]$mode", mode=new_mode.name),
+                    style="success",
+                )
+
+    @on(acp_messages.SetModes)
+    async def on_acp_set_modes(self, message: acp_messages.SetModes):
+        self.modes = message.modes
+        self.current_mode = self.modes[message.current_mode]
+
+    @on(messages.HistoryMove)
+    async def on_history_move(self, message: messages.HistoryMove) -> None:
+        message.stop()
+        if message.shell:
+            await self.shell_history.open()
+
+            if self.shell_history_index == 0:
+                current_shell_command = ""
+            else:
+                current_shell_command = (await self.shell_history.get_entry(self.shell_history_index))["input"]
+            while True:
+                self.shell_history_index += message.direction
+                new_entry = await self.shell_history.get_entry(self.shell_history_index)
+                if (new_entry)["input"] != current_shell_command:
+                    break
+                if message.direction == +1 and self.shell_history_index == 0:
+                    break
+                if message.direction == -1 and self.shell_history_index <= -self.shell_history.size:
+                    break
+        else:
+            await self.prompt_history.open()
+            self.prompt_history_index += message.direction
+
+    @work
+    async def request_permissions(
+        self,
+        result_future: Future[Answer],
+        options: list[Answer],
+        tool_call_update: acp_protocol.ToolCallUpdatePermissionRequest,
+    ) -> None:
+        kind = tool_call_update.get("kind", None)
+        title = tool_call_update.get("title", "") or ""
+
+        contents = tool_call_update.get("content", []) or []
+        # If all the content is diffs, we will set kind to "edit" to show the permisisons screen
+        for content in contents:
+            if content.get("type") != "diff":
+                break
+        else:
+            kind = "edit"
+
+        self.post_message(messages.SessionUpdate(state="asking"))
+
+        if kind == "edit":
+            diffs: list[tuple[str, str, str | None, str]] = []
+
+            contents = tool_call_update.get("content", []) or []
+            for content in contents:
+                match content:
+                    case {
+                        "type": "diff",
+                        "oldText": old_text,
+                        "newText": new_text,
+                        "path": path,
+                    }:
+                        diffs.append((path, path, old_text, new_text))
+
+            if diffs:
+                from localscript_ui.screens.permissions import PermissionsScreen
+
+                self.app.terminal_alert()
+                self.app.system_notify(
+                    f"{self.agent_title} would like to write files",
+                    title="Permissions request",
+                    sound="question",
+                )
+                permissions_screen = PermissionsScreen(options, diffs, agent_name=self.agent_title or "The Agent")
+                result = await self.app.push_screen_wait(permissions_screen, mode=self.screen.id)
+                self.post_message(messages.SessionUpdate(state="busy"))
+                self.app.terminal_alert(False)
+                result_future.set_result(result)
+                return
+
+        from localscript_ui.widgets.acp_content import ACPToolCallContent
+
+        def answer_callback(answer: Answer) -> None:
+            try:
+                result_future.set_result(answer)
+            except Exception:
+                # I've seen this occur in shutdown with an `InvalidStateError`
+                pass
+
+            if not self.prompt.ask_queue:
+                self.post_message(messages.SessionUpdate(state="busy"))
+
+        tool_call_content = tool_call_update.get("content", None) or []
+        self.ask(
+            options,
+            title or "",
+            (partial(ACPToolCallContent, tool_call_content) if tool_call_content else None),
+            answer_callback,
+        )
+        return
+
+    async def post_tool_call(self, tool_call_update: acp_protocol.ToolCallUpdate) -> None:
+        if (contents := tool_call_update.get("content")) is None:
+            return
+
+        for content in contents:
+            match content:
+                case {
+                    "type": "diff",
+                    "oldText": old_text,
+                    "newText": new_text,
+                    "path": path,
+                }:
+                    await self.post_diff(path, old_text, new_text)
+
+    async def post_diff(self, path: str, before: str | None, after: str) -> None:
+        """Post a diff view.
+
+        Args:
+            path: Path to the file.
+            before: Content of file before edit.
+            after: Content of file after edit.
+        """
+        from localscript_ui.widgets.diff_view import DiffView
+
+        diff_view = DiffView(path, path, before or "", after, classes="block")
+        diff_view_setting = self.app.settings.get("diff.view", str)
+        diff_view.split = diff_view_setting == "split"
+        diff_view.auto_split = diff_view_setting == "auto"
+        await self.post(diff_view)
+
+    def ask(
+        self,
+        options: list[Answer],
+        title: str = "",
+        get_content: Callable[[], Widget] | None = None,
+        callback: Callable[[Answer], Any] | None = None,
+    ) -> None:
+        """Replace the prompt with a dialog to ask a question
+
+        Args:
+            question: Question to ask or empty string to omit.
+            options: A list of (ANSWER, ANSWER_ID) tuples.
+            callback: Optional callable that will be invoked with the result.
+        """
+        from localscript_ui.widgets.question import Ask
+
+        _ = self.agent_info
+
+        if self.agent_title:
+            notify_title = f"[{self.agent_title}] {title}"
+        else:
+            notify_title = title
+        notify_message = "\n".join(f" • {option.text}" for option in options)
+        self.app.system_notify(notify_message, title=notify_title, sound="question")
+
+        self.prompt.ask(Ask(title, options, get_content, callback))
+
+    def _build_slash_commands(self) -> list[SlashCommand]:
+        slash_commands = [
+            SlashCommand("/about", "About LocalScript"),
+            SlashCommand(
+                "/clear",
+                "Clear conversation window",
+                "<optional number of lines to preserve>",
+            ),
+            SlashCommand(
+                "/rename",
+                "Give the current session a friendly name",
+                "<session name>",
+            ),
+            SlashCommand(
+                "/session-close",
+                "Close the current session",
+            ),
+            SlashCommand(
+                "/session-new",
+                "Open a new session in the current working directory",
+                "<initial prompt or command>",
+            ),
+            SlashCommand(
+                "/mcp",
+                "Manage MCP servers from .localscript/mcp.json",
+                "<list|add|enable|disable|remove>",
+            ),
+        ]
+
+        slash_commands.extend(self.agent_slash_commands)
+        deduplicated_slash_commands = {slash_command.command: slash_command for slash_command in slash_commands}
+        slash_commands = sorted(deduplicated_slash_commands.values(), key=attrgetter("command"))
+        return slash_commands
+
+    def update_slash_commands(self) -> None:
+        """Update slash commands, which may have changed since mounting."""
+        self.prompt.slash_commands = self._build_slash_commands()
+
+    async def on_mount(self) -> None:
+        self.trap_focus()
+        self.prompt.focus()
+        self.prompt.slash_commands = self._build_slash_commands()
+        self.call_after_refresh(self.post_welcome)
+        self.app.settings_changed_signal.subscribe(self, self._settings_changed)
+
+        self.shell_history.complete.add_words(self.app.settings.get("shell.allow_commands", expect_type=str).split())
+        _ = self.shell
+        if self._agent_data is not None:
+
+            async def start_agent() -> None:
+                """Start the agent after refreshing the UI."""
+                assert self._agent_data is not None
+                from localscript_ui.acp.agent import Agent
+
+                self.agent = Agent(
+                    self.project_path,
+                    self._agent_data,
+                    self._agent_session_id,
+                    self._session_pk,
+                )
+                await self.agent.start(self)
+                self.post_message(messages.SessionUpdate("New Session", self.agent_title))
+
+            self.call_after_refresh(start_agent)
+
+        else:
+            self.agent_ready = True
+
+        self.update_title()
+        self.window.anchor()
+
+    def _settings_changed(self, setting_item: tuple[str, str]) -> None:
+        key, value = setting_item
+        if key == "shell.allow_commands":
+            self.shell_history.complete.add_words(value.split())
+
+    @work
+    async def post_welcome(self) -> None:
+        """Post any welcome content."""
+
+    def watch_agent(self, agent: AgentBase | None) -> None:
+        if agent is None:
+            self.agent_info = Content.styled("shell")
+        else:
+            self.agent_info = agent.get_info()
+            self.agent_ready = False
+        self.update_title()
+
+    @work
+    async def watch_agent_ready(self, ready: bool) -> None:
+        with suppress(asyncio.TimeoutError):
+            async with asyncio.timeout(2.0):
+                await self.shell.wait_for_ready()
+        if ready:
+            self._directory_watcher = DirectoryWatcher(self.project_path, self)
+            self._directory_watcher.start()
+        if ready and (agent_data := self._agent_data) is not None:
+            welcome = agent_data.get("welcome", None)
+            if welcome is not None:
+                from localscript_ui.widgets.markdown_note import MarkdownNote
+
+                await self.post(MarkdownNote(welcome))
+        if ready and self._initial_prompt is not None:
+            prompt = self._initial_prompt
+            if prompt.startswith("!"):
+                self.post_message(messages.UserInputSubmitted(self._initial_prompt[1:], shell=True))
+            else:
+                self.post_message(messages.UserInputSubmitted(self._initial_prompt, shell=False))
+            self._initial_prompt = None
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._mouse_down_offset = event.screen_offset
+
+    def on_click(self, event: events.Click) -> None:
+        if self._mouse_down_offset is not None and event.screen_offset != self._mouse_down_offset:
+            return
+        widget = event.widget
+
+        contents = self.contents
+        if self.screen.get_selected_text():
+            return
+        if widget is None or widget.is_maximized:
+            return
+        try:
+            widget.query_ancestor(Prompt)
+        except NoMatches:
+            pass
+        else:
+            return
+
+        if widget in contents.displayed_children:
+            self.cursor_offset = contents.displayed_children.index(widget)
+            self.refresh_block_cursor()
+            return
+        for parent in widget.ancestors:
+            if not isinstance(parent, Widget):
+                break
+            if (parent is self or parent is contents) and widget in contents.displayed_children:
+                self.cursor_offset = contents.displayed_children.index(widget)
+                self.refresh_block_cursor()
+                break
+            if isinstance(parent, BlockProtocol) and parent in contents.displayed_children:
+                self.cursor_offset = contents.displayed_children.index(parent)
+                parent.block_select(widget)
+                self.refresh_block_cursor()
+                break
+            widget = parent
+
+    def new_block(self) -> None:
+        """Start a new block for agent response."""
+        self._agent_thought = None
+        self._agent_response = None
+
+    async def post[WidgetType: Widget](
+        self,
+        widget: WidgetType,
+        *,
+        loading: bool = False,
+        new_block: bool = True,
+    ) -> WidgetType:
+        """Post a widget to the converstaion.
+
+        Args:
+            widget: Widget to post.
+            loading: Set the widget to an initial loading state?
+            new_block: Start a new block?
+
+        Returns:
+            The widget that was mounted.
+        """
+        if self._loading is not None:
+            await self._loading.remove()
+        if new_block and not loading:
+            self.new_block()
+        if not self.contents.is_attached:
+            return widget
+        await self.contents.mount(widget)
+
+        widget.loading = loading
+        self._require_check_prune = True
+        self.call_after_refresh(self.check_prune)
+        return widget
+
+    async def check_prune(self) -> None:
+        """Check if a prune is required."""
+        if self._require_check_prune:
+            self._require_check_prune = False
+            low_mark = self.app.settings.get("ui.prune_low_mark", int)
+            high_mark = low_mark + self.app.settings.get("ui.prune_excess", int)
+            await self.prune_window(low_mark, high_mark)
+
+    async def prune_window(self, low_mark: int, high_mark: int) -> None:
+        """Remove older children to keep within a certain range.
+
+        Args:
+            low_mark: Height to aim for.
+            high_mark: Height to start pruning.
+        """
+
+        assert high_mark >= low_mark
+
+        contents = self.contents
+
+        height = contents.virtual_size.height
+        if height <= high_mark:
+            return
+        prune_children: list[Widget] = []
+        bottom_margin = 0
+        prune_height = 0
+
+        if low_mark == 0:
+            prune_children = list(contents.children)
+        else:
+            for child in contents.children:
+                if not child.display:
+                    prune_children.append(child)
+                    continue
+                top, _, bottom, _ = child.styles.margin
+                child_height = child.outer_size.height
+                prune_height = (prune_height - bottom_margin + max(bottom_margin, top)) + bottom + child_height
+                bottom_margin = bottom
+                if height - prune_height <= low_mark:
+                    break
+                prune_children.append(child)
+
+        self.cursor_offset = -1
+        self.cursor.visible = False
+        self.cursor.follow(None)
+        contents.refresh(layout=True)
+
+        if prune_children:
+            await contents.remove_children(prune_children)
+
+        self.call_later(self.window.anchor)
+
+    async def new_terminal(self) -> Terminal:
+        """Create a new interactive Terminal.
+
+        Args:
+            width: Initial width of the terminal.
+            display: Initial display.
+
+        Returns:
+            A new (mounted) Terminal widget.
+        """
+
+        if (terminal := self._terminal) is not None:
+            if terminal.state.buffer.is_blank:
+                terminal.finalize()
+                await terminal.remove()
+
+        self._terminal_count += 1
+
+        terminal_width, terminal_height = self.get_terminal_dimensions()
+        terminal = ShellTerminal(
+            f"terminal #{self._terminal_count}",
+            id=f"shell-terminal-{self._terminal_count}",
+            size=(terminal_width, terminal_height),
+            get_terminal_dimensions=self.get_terminal_dimensions,
+        )
+
+        terminal.display = False
+        terminal = await self.post(terminal)
+        self.add_focusable_terminal(terminal)
+        self.refresh_bindings()
+        return terminal
+
+    def get_terminal_dimensions(self) -> tuple[int, int]:
+        """Get the default dimensions of new terminals.
+
+        Returns:
+            Tuple of (WIDTH, HEIGHT)
+        """
+        terminal_width = max(
+            16,
+            (self.window.size.width - 2 - self.window.styles.scrollbar_size_vertical),
+        )
+        terminal_height = max(8, self.window.scrollable_content_region.height)
+        return terminal_width, terminal_height
+
+    @property
+    def shell(self) -> Shell:
+        """A Shell instance."""
+
+        if self._shell is None or self._shell.is_finished:
+            shell_command = self.app.settings.get(
+                "shell.command",
+                str,
+                expand=False,
+            )
+            shell_start = self.app.settings.get(
+                "shell.command_start",
+                str,
+                expand=False,
+            )
+            shell_directory = self.working_directory
+            self._shell = Shell(self, shell_directory, shell=shell_command, start=shell_start)
+            self._shell.start()
+        return self._shell
+
+    async def post_shell(self, command: str) -> None:
+        """Post a command to the shell.
+
+        Args:
+            command: Command to execute.
+        """
+        from localscript_ui.widgets.shell_result import ShellResult
+
+        if command.strip():
+            self._shell_count += 1
+            await self.post(ShellResult(command))
+            width, height = self.get_terminal_dimensions()
+            await self.shell.send(command, width, height)
+
+    def action_cursor_up(self) -> None:
+        if not self.contents.displayed_children or self.cursor_offset == 0:
+            # No children
+            return
+        if self.cursor_offset == -1:
+            # Start cursor at end
+            self.cursor_offset = len(self.contents.displayed_children) - 1
+            cursor_block = self.cursor_block
+            if isinstance(cursor_block, BlockProtocol):
+                cursor_block.block_cursor_clear()
+                cursor_block.block_cursor_up()
+        else:
+            cursor_block = self.cursor_block
+            if isinstance(cursor_block, BlockProtocol):
+                if cursor_block.block_cursor_up() is None:
+                    self.cursor_offset -= 1
+                    cursor_block = self.cursor_block
+                    if isinstance(cursor_block, BlockProtocol):
+                        cursor_block.block_cursor_clear()
+                        cursor_block.block_cursor_up()
+            else:
+                # Move cursor up
+                self.cursor_offset -= 1
+                cursor_block = self.cursor_block
+                if isinstance(cursor_block, BlockProtocol):
+                    cursor_block.block_cursor_clear()
+                    cursor_block.block_cursor_up()
+        self.refresh_block_cursor()
+
+    def action_cursor_down(self) -> None:
+        if not self.contents.displayed_children or self.cursor_offset == -1:
+            # No children, or no cursor
+            return
+
+        cursor_block = self.cursor_block
+        if isinstance(cursor_block, BlockProtocol):
+            if cursor_block.block_cursor_down() is None:
+                self.cursor_offset += 1
+                if self.cursor_offset >= len(self.contents.displayed_children):
+                    self.cursor_offset = -1
+                    self.refresh_block_cursor()
+                    return
+                cursor_block = self.cursor_block
+                if isinstance(cursor_block, BlockProtocol):
+                    cursor_block.block_cursor_clear()
+                    cursor_block.block_cursor_down()
+        else:
+            self.cursor_offset += 1
+            if self.cursor_offset >= len(self.contents.displayed_children):
+                self.cursor_offset = -1
+                self.refresh_block_cursor()
+                return
+            cursor_block = self.cursor_block
+            if isinstance(cursor_block, BlockProtocol):
+                cursor_block.block_cursor_clear()
+                cursor_block.block_cursor_down()
+        self.refresh_block_cursor()
+
+    @work
+    async def action_cancel(self) -> None:
+        if monotonic() - self._last_escape_time < 3:
+            if (agent := self.agent) is not None:
+                if await agent.cancel():
+                    self.flash("Turn cancelled", style="success")
+                else:
+                    self.flash("Agent declined to cancel. Please wait.", style="error")
+        else:
+            self.flash("Press [b]esc[/] again to cancel agent's turn")
+            self._last_escape_time = monotonic()
+
+    def focus_prompt(self, reset_cursor: bool = True, scroll_end: bool = True) -> None:
+        """Focus the prompt input.
+
+        Args:
+            reset_cursor: Reset the block cursor.
+            scroll_end: Scroll t the end of the content.
+        """
+        if reset_cursor:
+            self.cursor_offset = -1
+            self.cursor.visible = False
+        if scroll_end:
+            self.window.scroll_end()
+        self.prompt.focus()
+
+    async def action_select_block(self) -> None:
+        if (block := self.get_cursor_block(Widget)) is None:
+            return
+
+        menu_options = [
+            MenuItem("[u]C[/]opy to clipboard", "copy_to_clipboard", "c"),
+            MenuItem("Co[u]p[/u]y to prompt", "copy_to_prompt", "p"),
+            MenuItem("Open as S[u]V[/]G", "export_to_svg", "v"),
+        ]
+
+        print(repr(block))
+        if block.allow_maximize:
+            menu_options.append(MenuItem("[u]M[/u]aximize", "maximize_block", "m"))
+
+        if isinstance(block, MenuProtocol):
+            menu_options.extend(block.get_block_menu())
+            menu = Menu(block, menu_options)
+        else:
+            menu = Menu(block, menu_options)
+
+        menu.offset = Offset(1, block.region.offset.y)
+        await self.mount(menu)
+        menu.focus()
+
+    def action_copy_to_clipboard(self) -> None:
+        block = self.get_cursor_block()
+        if isinstance(block, MenuProtocol):
+            text = block.get_block_content("clipboard")
+        elif isinstance(block, MarkdownFence):
+            text = block._content.plain
+        elif isinstance(block, MarkdownBlock):
+            text = block.source
+        else:
+            return
+        if text:
+            self.app.copy_to_clipboard(text)
+            self.flash("Copied to clipboard")
+
+    def action_copy_to_prompt(self) -> None:
+        block = self.get_cursor_block()
+        if isinstance(block, MenuProtocol):
+            text = block.get_block_content("prompt")
+        elif isinstance(block, MarkdownFence):
+            # Copy to prompt leaves MD formatting
+            text = block.source
+        elif isinstance(block, MarkdownBlock):
+            text = block.source
+        else:
+            return
+
+        if text:
+            self.prompt.append(text)
+            self.flash("Copied to prompt")
+            self.focus_prompt()
+
+    def action_maximize_block(self) -> None:
+        if (block := self.get_cursor_block()) is not None:
+            self.screen.maximize(block, container=False)
+            block.focus()
+
+    def action_export_to_svg(self) -> None:
+        block = self.get_cursor_block()
+        if block is None:
+            return
+        import platformdirs
+        from textual._compositor import Compositor
+        from textual._files import generate_datetime_filename
+
+        width, height = block.outer_size
+        compositor = Compositor()
+        compositor.reflow(block, block.outer_size)
+        render = compositor.render_full_update()
+
+        import io
+        import os.path
+
+        from rich.console import Console
+
+        console = Console(
+            width=width,
+            height=height,
+            file=io.StringIO(),
+            force_terminal=True,
+            color_system="truecolor",
+            record=True,
+            legacy_windows=False,
+            safe_box=False,
+        )
+        console.print(render)
+        path = platformdirs.user_pictures_dir()
+        svg_filename = generate_datetime_filename("LocalScript", ".svg", None)
+        svg_path = os.path.expanduser(os.path.join(path, svg_filename))
+        console.save_svg(svg_path)
+        import webbrowser
+
+        webbrowser.open(f"file:///{svg_path}")
+
+    async def action_mode_switcher(self) -> None:
+        self.prompt.mode_switcher.focus()
+
+    def refresh_block_cursor(self) -> None:
+        if (cursor_block := self.cursor_block_child) is not None:
+            self.window.focus()
+            self.cursor.visible = True
+            self.cursor.follow(cursor_block)
+            self.call_after_refresh(self.window.scroll_to_center, cursor_block, immediate=True)
+        else:
+            self.cursor.visible = False
+            self.window.anchor(False)
+            self.window.scroll_end(duration=2 / 10)
+            self.cursor.follow(None)
+            self.prompt.focus()
+        self.refresh_bindings()
+
+    async def slash_command(self, text: str) -> bool:
+        """Give LocalScript UI the opportunity to process slash commands.
+
+        Args:
+            text: The prompt, including the slash in the first position.
+
+        Returns:
+            `True` if LocalScript UI has processed the slash command, `False` if it should
+                be forwarded to the agent.
+        """
+        command, _, parameters = text[1:].partition(" ")
+        if command in {"about", "localscript:about"}:
+            from localscript_ui import about
+            from localscript_ui.widgets.markdown_note import MarkdownNote
+
+            app = self.app
+            about_md = about.render(app)
+            await self.post(MarkdownNote(about_md, classes="about"))
+            self.app.copy_to_clipboard(about_md)
+            self.notify(
+                "A copy of /about has been placed in your clipboard",
+                title="/about",
+            )
+            return True
+        elif command in {"clear", "localscript:clear"}:
+            try:
+                line_count = max(0, int(parameters) if parameters.strip() else 0)
+            except ValueError:
+                self.notify(
+                    "Unable to clear—a number was expected",
+                    title="/clear",
+                    severity="error",
+                )
+                return True
+            await self.prune_window(line_count, line_count)
+            return True
+        elif command in {"rename", "localscript:rename"}:
+            name = parameters.strip()
+            if not name:
+                self.notify(
+                    'Expected a name for the session.\nFor example: "add comments to blog"',
+                    title="/rename",
+                    severity="error",
+                )
+                return True
+            if self.agent is not None:
+                await self.agent.set_session_name(name)
+                self.post_message(messages.SessionUpdate(name=name))
+                self.flash(f"Renamed session to [b]'{name}'", style="success")
+            return True
+        elif command in {"session-close", "localscript:session-close"}:
+            if self.turn == "agent" and self.agent is not None:
+                await self.agent.cancel()
+            if self.screen.id is not None:
+                self.post_message(messages.SessionClose(self.screen.id))
+                return True
+        elif command in {"session-new", "localscript:session-new"}:
+            if self._agent_data is not None:
+                self.post_message(
+                    messages.SessionNew(
+                        self.working_directory,
+                        self._agent_data["identity"],
+                        parameters.strip(),
+                    )
+                )
+                return True
+        elif command == "mcp":
+            return await self._slash_mcp(parameters)
+        return False
+
+    async def _slash_mcp(self, parameters: str) -> bool:
+        from localscript_ui.widgets.markdown_note import MarkdownNote
+
+        workspace_root = self.project_path.resolve()
+        raw = parameters.strip()
+        if not raw or raw == "list":
+            await self.post(MarkdownNote(self._render_mcp_help(workspace_root), classes="about"))
+            return True
+
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            self.notify(str(exc), title="/mcp", severity="error")
+            return True
+
+        action = tokens[0].lower()
+        if action == "help":
+            await self.post(MarkdownNote(self._render_mcp_help(workspace_root), classes="about"))
+            return True
+        if action == "add":
+            if len(tokens) < 3:
+                self.notify("Usage: /mcp add <name> <command...>", title="/mcp", severity="error")
+                return True
+            name = tokens[1]
+            command = tokens[2]
+            args = tokens[3:]
+            add_server(workspace_root, name=name, command=command, args=args)
+            self.flash(f"Added MCP server '{name}'", style="success")
+            return True
+        if action == "refresh":
+            if len(tokens) > 2:
+                self.notify("Usage: /mcp refresh [server]", title="/mcp", severity="error")
+                return True
+            target_server = tokens[1] if len(tokens) == 2 else None
+            refresh_server_tools(workspace_root, name=target_server)
+            if target_server is None:
+                self.flash("Refreshed MCP tools for all configured servers", style="success")
+            else:
+                self.flash(f"Refreshed MCP tools for '{target_server}'", style="success")
+            return True
+        if action == "describe":
+            if len(tokens) < 4:
+                self.notify("Usage: /mcp describe <server> <tool> <description...>", title="/mcp", severity="error")
+                return True
+            server_name = tokens[1]
+            tool_name = tokens[2]
+            description = " ".join(tokens[3:]).strip()
+            try:
+                set_tool_custom_description(
+                    workspace_root,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    description=description,
+                )
+            except KeyError:
+                self.notify("Unknown MCP server or tool.", title="/mcp", severity="error")
+                return True
+            self.flash(f"Updated custom description for '{tool_name}' on '{server_name}'", style="success")
+            return True
+        if action == "undescribe":
+            if len(tokens) != 3:
+                self.notify("Usage: /mcp undescribe <server> <tool>", title="/mcp", severity="error")
+                return True
+            try:
+                clear_tool_custom_description(
+                    workspace_root,
+                    server_name=tokens[1],
+                    tool_name=tokens[2],
+                )
+            except KeyError:
+                self.notify("Unknown MCP server or tool.", title="/mcp", severity="error")
+                return True
+            self.flash(f"Removed custom description for '{tokens[2]}' on '{tokens[1]}'", style="success")
+            return True
+        if action == "remove":
+            if len(tokens) != 2:
+                self.notify("Usage: /mcp remove <name>", title="/mcp", severity="error")
+                return True
+            remove_server(workspace_root, name=tokens[1])
+            self.flash(f"Removed MCP server '{tokens[1]}'", style="success")
+            return True
+        if action == "enable":
+            if len(tokens) not in {2, 3}:
+                self.notify("Usage: /mcp enable <server> [tool]", title="/mcp", severity="error")
+                return True
+            try:
+                if len(tokens) == 2:
+                    enable_server(workspace_root, name=tokens[1])
+                    self.flash(f"Enabled MCP server '{tokens[1]}'", style="success")
+                else:
+                    enable_tool(workspace_root, server_name=tokens[1], tool_name=tokens[2])
+                    self.flash(f"Enabled MCP tool '{tokens[2]}' on '{tokens[1]}'", style="success")
+            except KeyError:
+                self.notify("Unknown MCP server or tool.", title="/mcp", severity="error")
+                return True
+            return True
+        if action == "disable":
+            if len(tokens) not in {2, 3}:
+                self.notify("Usage: /mcp disable <server> [tool]", title="/mcp", severity="error")
+                return True
+            try:
+                if len(tokens) == 2:
+                    disable_server(workspace_root, name=tokens[1])
+                    self.flash(f"Disabled MCP server '{tokens[1]}'", style="success")
+                else:
+                    disable_tool(workspace_root, server_name=tokens[1], tool_name=tokens[2])
+                    self.flash(f"Disabled MCP tool '{tokens[2]}' on '{tokens[1]}'", style="success")
+            except KeyError:
+                self.notify("Unknown MCP server or tool.", title="/mcp", severity="error")
+                return True
+            return True
+
+        self.notify(
+            "Unknown /mcp action. Use /mcp, /mcp list, /mcp add, /mcp refresh, /mcp describe, /mcp undescribe, /mcp enable, /mcp disable, or /mcp remove.",
+            title="/mcp",
+            severity="error",
+        )
+        return True
+
+    def _render_mcp_help(self, workspace_root: Path) -> str:
+        config_path = config_path_for_workspace(workspace_root)
+        servers = list_servers(workspace_root)
+        lines = [
+            "# MCP Servers",
+            "",
+            f"Config file: `{config_path}`",
+            "",
+            "Commands:",
+            "- `/mcp list`",
+            "- `/mcp add <name> <command...>`",
+            "- `/mcp refresh [server]`",
+            "- `/mcp describe <server> <tool> <description...>`",
+            "- `/mcp undescribe <server> <tool>`",
+            "- `/mcp enable <server> [tool]`",
+            "- `/mcp disable <server> [tool]`",
+            "- `/mcp remove <name>`",
+            "",
+            "Examples:",
+            "- `/mcp add filesystem npx -y @modelcontextprotocol/server-filesystem .`",
+            "- `/mcp add github npx -y @modelcontextprotocol/server-github`",
+            "- `/mcp describe context7 resolve-library-id Resolve a library name to a Context7 ID.`",
+            "",
+            "Configured servers:",
+        ]
+        if not servers:
+            lines.append("- none")
+        else:
+            for server in servers:
+                status = "enabled" if server.get("enabled", True) else "disabled"
+                args = " ".join(shlex.quote(arg) for arg in server.get("args", []))
+                command = " ".join(part for part in [server["command"], args] if part).strip()
+                lines.append(f"- `{server['name']}`: `{command}` ({status})")
+                tools = server.get("tools", [])
+                if not tools:
+                    lines.append("  - tools: none discovered yet")
+                else:
+                    for tool in tools:
+                        tool_status = "enabled" if tool.get("enabled", True) else "disabled"
+                        title = tool.get("title") or tool["name"]
+                        description = (
+                            tool.get("custom_description")
+                            or tool.get("summary")
+                            or tool.get("description", "")
+                        )
+                        suffix = f": {description}" if description else ""
+                        lines.append(f"  - `{tool['name']}` [{tool_status}] ({title}){suffix}")
+        return "\n".join(lines)
